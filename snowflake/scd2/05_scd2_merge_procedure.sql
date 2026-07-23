@@ -1,0 +1,97 @@
+CREATE OR REPLACE PROCEDURE GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.SP_SCD2_ORDERSUMMARY()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    V_CURRENT_TS TIMESTAMP_NTZ := CURRENT_TIMESTAMP();
+    V_END_OF_TIME TIMESTAMP_NTZ := '9999-12-31'::TIMESTAMP_NTZ;
+BEGIN
+    -- Create a staging view of the current source data (joined customer + order)
+    CREATE OR REPLACE TEMPORARY TABLE GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.STG_ORDERSUMMARY AS
+    SELECT
+        C.CUSTID,
+        C.NAME,
+        C.EMAILID,
+        C.REGION,
+        O.ORDERID,
+        O.ITEMNAME,
+        O.PRICEPERUNIT,
+        O.QTY,
+        O.DATE
+    FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.CLEAN_ORDER O
+    INNER JOIN GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.CLEAN_CUSTOMER C
+        ON O.CUSTID = C.CUSTID;
+
+    -- Step 1: Expire existing active records where changes are detected
+    -- A change is detected when any non-key column differs
+    UPDATE GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.ORDERSUMMARY TGT
+    SET
+        ENDDATE = :V_CURRENT_TS,
+        ISACTIVE = FALSE
+    WHERE TGT.ISACTIVE = TRUE
+      AND EXISTS (
+          SELECT 1
+          FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.STG_ORDERSUMMARY SRC
+          WHERE SRC.ORDERID = TGT.ORDERID
+            AND SRC.CUSTID = TGT.CUSTID
+            AND (
+                NVL(SRC.NAME, '') != NVL(TGT.NAME, '')
+                OR NVL(SRC.EMAILID, '') != NVL(TGT.EMAILID, '')
+                OR NVL(SRC.REGION, '') != NVL(TGT.REGION, '')
+                OR NVL(SRC.ITEMNAME, '') != NVL(TGT.ITEMNAME, '')
+                OR NVL(SRC.PRICEPERUNIT, 0) != NVL(TGT.PRICEPERUNIT, 0)
+                OR NVL(SRC.QTY, 0) != NVL(TGT.QTY, 0)
+                OR NVL(SRC.DATE, '1900-01-01'::DATE) != NVL(TGT.DATE, '1900-01-01'::DATE)
+            )
+      );
+
+    -- Step 2: Insert new versions of changed records and brand new records
+    INSERT INTO GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.ORDERSUMMARY (
+        CUSTID, NAME, EMAILID, REGION, ORDERID, ITEMNAME, PRICEPERUNIT, QTY, DATE, STARTDATE, ENDDATE, ISACTIVE
+    )
+    SELECT
+        SRC.CUSTID,
+        SRC.NAME,
+        SRC.EMAILID,
+        SRC.REGION,
+        SRC.ORDERID,
+        SRC.ITEMNAME,
+        SRC.PRICEPERUNIT,
+        SRC.QTY,
+        SRC.DATE,
+        :V_CURRENT_TS,
+        :V_END_OF_TIME,
+        TRUE
+    FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.STG_ORDERSUMMARY SRC
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.ORDERSUMMARY TGT
+        WHERE TGT.ORDERID = SRC.ORDERID
+          AND TGT.CUSTID = SRC.CUSTID
+          AND TGT.ISACTIVE = TRUE
+    );
+
+    -- Step 3: Expire records in target that no longer exist in source (soft delete)
+    UPDATE GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.ORDERSUMMARY TGT
+    SET
+        ENDDATE = :V_CURRENT_TS,
+        ISACTIVE = FALSE
+    WHERE TGT.ISACTIVE = TRUE
+      AND NOT EXISTS (
+          SELECT 1
+          FROM GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.STG_ORDERSUMMARY SRC
+          WHERE SRC.ORDERID = TGT.ORDERID
+            AND SRC.CUSTID = TGT.CUSTID
+      );
+
+    -- Drop temporary staging table
+    DROP TABLE IF EXISTS GEN_AI_POC_SNOWFLAKECOE.SDLC_WIZARD.STG_ORDERSUMMARY;
+
+    RETURN 'SCD Type 2 merge completed successfully';
+EXCEPTION
+    WHEN OTHER THEN
+        RETURN OBJECT_CONSTRUCT('error', SQLERRM)::VARCHAR;
+END;
+$$;
