@@ -1,0 +1,11 @@
+COPY INTO IDEA_2_DB.PUBLIC.CUSTOMER (CUSTID, NAME, EMAILID, REGION)
+FROM @gen_ai_poc_snowflakecoe.sdlc_wizard_stage/customerdata
+FILE_FORMAT = (
+    TYPE = 'CSV'
+    FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+    SKIP_HEADER = 1
+    NULL_IF = ('NULL', 'null', '')
+    EMPTY_FIELD_AS_NULL = TRUE
+    ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
+)
+ON_ERROR = CONTINUE;
