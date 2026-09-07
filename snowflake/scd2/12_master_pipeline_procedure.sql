@@ -1,0 +1,269 @@
+CREATE OR REPLACE PROCEDURE IDEA_2_DB.PUBLIC.SP_MASTER_PIPELINE()
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    V_STEP VARCHAR;
+    V_ERROR_MSG VARCHAR;
+    V_ROWS_CUSTOMER NUMBER;
+    V_ROWS_ORDER NUMBER;
+    V_ROWS_SUMMARY NUMBER;
+    V_ROWS_AGGREGATE NUMBER;
+BEGIN
+    -- Step 1: Load customer data from stage
+    V_STEP := 'LOAD_CUSTOMER_DATA';
+    
+    COPY INTO IDEA_2_DB.PUBLIC.CUSTOMER (CUSTID, NAME, EMAILID, REGION)
+    FROM @gen_ai_poc_snowflakecoe.sdlc_wizard_stage/customerdata
+    FILE_FORMAT = (
+        TYPE = 'CSV'
+        FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+        SKIP_HEADER = 1
+        NULL_IF = ('NULL', 'null', '')
+        EMPTY_FIELD_AS_NULL = TRUE
+        ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
+    )
+    ON_ERROR = CONTINUE;
+
+    -- Step 2: Load order data from stage
+    V_STEP := 'LOAD_ORDER_DATA';
+    
+    COPY INTO IDEA_2_DB.PUBLIC."order" (ORDERID, CUSTID, ITEMNAME, PRICEPERUNIT, QTY, ORDER_DATE, STARTDATE, ENDDATE, ISACTIVE)
+    FROM @gen_ai_poc_snowflakecoe.sdlc_wizard_stage/orderdata
+    FILE_FORMAT = (
+        TYPE = 'CSV'
+        FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+        SKIP_HEADER = 1
+        NULL_IF = ('NULL', 'null', '')
+        EMPTY_FIELD_AS_NULL = TRUE
+        ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE
+    )
+    ON_ERROR = CONTINUE;
+
+    -- Step 3: Clean customer data - remove nulls
+    V_STEP := 'CLEAN_CUSTOMER_NULLS';
+    
+    DELETE FROM IDEA_2_DB.PUBLIC.CUSTOMER
+    WHERE CUSTID IS NULL
+       OR NAME IS NULL
+       OR EMAILID IS NULL;
+
+    -- Step 4: Clean customer data - remove duplicates
+    V_STEP := 'CLEAN_CUSTOMER_DUPLICATES';
+    
+    CREATE OR REPLACE TEMPORARY TABLE IDEA_2_DB.PUBLIC.CUSTOMER_DEDUP AS
+    SELECT *
+    FROM IDEA_2_DB.PUBLIC.CUSTOMER
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY CUSTID ORDER BY LOAD_TIMESTAMP DESC) = 1;
+
+    TRUNCATE TABLE IDEA_2_DB.PUBLIC.CUSTOMER;
+
+    INSERT INTO IDEA_2_DB.PUBLIC.CUSTOMER
+    SELECT * FROM IDEA_2_DB.PUBLIC.CUSTOMER_DEDUP;
+
+    V_ROWS_CUSTOMER := SQLROWCOUNT;
+
+    -- Step 5: Clean order data - remove nulls
+    V_STEP := 'CLEAN_ORDER_NULLS';
+    
+    DELETE FROM IDEA_2_DB.PUBLIC."order"
+    WHERE ORDERID IS NULL
+       OR CUSTID IS NULL
+       OR ITEMNAME IS NULL
+       OR PRICEPERUNIT IS NULL
+       OR QTY IS NULL;
+
+    -- Step 6: Clean order data - remove duplicates
+    V_STEP := 'CLEAN_ORDER_DUPLICATES';
+    
+    CREATE OR REPLACE TEMPORARY TABLE IDEA_2_DB.PUBLIC.ORDER_DEDUP AS
+    SELECT *
+    FROM IDEA_2_DB.PUBLIC."order"
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY ORDERID ORDER BY LOAD_TIMESTAMP DESC) = 1;
+
+    TRUNCATE TABLE IDEA_2_DB.PUBLIC."order";
+
+    INSERT INTO IDEA_2_DB.PUBLIC."order"
+    SELECT * FROM IDEA_2_DB.PUBLIC.ORDER_DEDUP;
+
+    V_ROWS_ORDER := SQLROWCOUNT;
+
+    -- Step 7: Validate data exists
+    V_STEP := 'VALIDATE_DATA';
+    
+    SELECT COUNT(*) INTO :V_ROWS_CUSTOMER FROM IDEA_2_DB.PUBLIC.CUSTOMER;
+    SELECT COUNT(*) INTO :V_ROWS_ORDER FROM IDEA_2_DB.PUBLIC."order";
+
+    IF (V_ROWS_CUSTOMER = 0 OR V_ROWS_ORDER = 0) THEN
+        INSERT INTO IDEA_2_DB.PUBLIC.ERROR_LOG (PROCEDURE_NAME, ERROR_MESSAGE, ERROR_STATE)
+        VALUES ('SP_MASTER_PIPELINE', 'Validation failed: Customer rows=' || V_ROWS_CUSTOMER || ', Order rows=' || V_ROWS_ORDER, 'VALIDATION_ERROR');
+        
+        RETURN OBJECT_CONSTRUCT(
+            'status', 'ERROR',
+            'step', V_STEP,
+            'message', 'No data found after cleaning. Customer rows: ' || V_ROWS_CUSTOMER || ', Order rows: ' || V_ROWS_ORDER
+        )::VARCHAR;
+    END IF;
+
+    -- Step 8: Create staging table for ordersummary SCD2
+    V_STEP := 'CREATE_ORDERSUMMARY_STG';
+    
+    CREATE OR REPLACE TEMPORARY TABLE IDEA_2_DB.PUBLIC.ORDERSUMMARY_STG AS
+    SELECT
+        O.ORDERID,
+        C.CUSTID,
+        C.NAME,
+        C.EMAILID,
+        C.REGION,
+        O.ITEMNAME,
+        O.PRICEPERUNIT,
+        O.QTY,
+        (O.PRICEPERUNIT * O.QTY) AS TOTALAMOUNT,
+        O.ORDER_DATE,
+        O.STARTDATE,
+        O.ENDDATE,
+        O.ISACTIVE
+    FROM IDEA_2_DB.PUBLIC."order" O
+    INNER JOIN IDEA_2_DB.PUBLIC.CUSTOMER C
+        ON O.CUSTID = C.CUSTID;
+
+    -- Step 9: SCD2 - Expire changed records
+    V_STEP := 'SCD2_EXPIRE_RECORDS';
+    
+    UPDATE IDEA_2_DB.PUBLIC.ORDERSUMMARY TGT
+    SET
+        IS_CURRENT = FALSE,
+        EFFECTIVE_TO = CURRENT_TIMESTAMP()
+    WHERE TGT.IS_CURRENT = TRUE
+      AND EXISTS (
+          SELECT 1
+          FROM IDEA_2_DB.PUBLIC.ORDERSUMMARY_STG STG
+          WHERE STG.ORDERID = TGT.ORDERID
+            AND STG.CUSTID = TGT.CUSTID
+            AND (
+                NVL(STG.NAME, '') != NVL(TGT.NAME, '')
+                OR NVL(STG.EMAILID, '') != NVL(TGT.EMAILID, '')
+                OR NVL(STG.REGION, '') != NVL(TGT.REGION, '')
+                OR NVL(STG.ITEMNAME, '') != NVL(TGT.ITEMNAME, '')
+                OR NVL(STG.PRICEPERUNIT, 0) != NVL(TGT.PRICEPERUNIT, 0)
+                OR NVL(STG.QTY, 0) != NVL(TGT.QTY, 0)
+            )
+      );
+
+    -- Step 10: SCD2 - Insert new versions of changed records
+    V_STEP := 'SCD2_INSERT_CHANGED';
+    
+    INSERT INTO IDEA_2_DB.PUBLIC.ORDERSUMMARY (
+        ORDERID, CUSTID, NAME, EMAILID, REGION, ITEMNAME,
+        PRICEPERUNIT, QTY, TOTALAMOUNT, ORDER_DATE, STARTDATE, ENDDATE,
+        ISACTIVE, IS_CURRENT, EFFECTIVE_FROM, EFFECTIVE_TO, LOAD_TIMESTAMP
+    )
+    SELECT
+        STG.ORDERID,
+        STG.CUSTID,
+        STG.NAME,
+        STG.EMAILID,
+        STG.REGION,
+        STG.ITEMNAME,
+        STG.PRICEPERUNIT,
+        STG.QTY,
+        STG.TOTALAMOUNT,
+        STG.ORDER_DATE,
+        STG.STARTDATE,
+        STG.ENDDATE,
+        STG.ISACTIVE,
+        TRUE,
+        CURRENT_TIMESTAMP(),
+        '9999-12-31 00:00:00',
+        CURRENT_TIMESTAMP()
+    FROM IDEA_2_DB.PUBLIC.ORDERSUMMARY_STG STG
+    WHERE EXISTS (
+        SELECT 1
+        FROM IDEA_2_DB.PUBLIC.ORDERSUMMARY TGT
+        WHERE TGT.ORDERID = STG.ORDERID
+          AND TGT.CUSTID = STG.CUSTID
+          AND TGT.IS_CURRENT = FALSE
+          AND TGT.EFFECTIVE_TO >= DATEADD('MINUTE', -5, CURRENT_TIMESTAMP())
+    );
+
+    -- Step 11: SCD2 - Insert brand new records
+    V_STEP := 'SCD2_INSERT_NEW';
+    
+    INSERT INTO IDEA_2_DB.PUBLIC.ORDERSUMMARY (
+        ORDERID, CUSTID, NAME, EMAILID, REGION, ITEMNAME,
+        PRICEPERUNIT, QTY, TOTALAMOUNT, ORDER_DATE, STARTDATE, ENDDATE,
+        ISACTIVE, IS_CURRENT, EFFECTIVE_FROM, EFFECTIVE_TO, LOAD_TIMESTAMP
+    )
+    SELECT
+        STG.ORDERID,
+        STG.CUSTID,
+        STG.NAME,
+        STG.EMAILID,
+        STG.REGION,
+        STG.ITEMNAME,
+        STG.PRICEPERUNIT,
+        STG.QTY,
+        STG.TOTALAMOUNT,
+        STG.ORDER_DATE,
+        STG.STARTDATE,
+        STG.ENDDATE,
+        STG.ISACTIVE,
+        TRUE,
+        CURRENT_TIMESTAMP(),
+        '9999-12-31 00:00:00',
+        CURRENT_TIMESTAMP()
+    FROM IDEA_2_DB.PUBLIC.ORDERSUMMARY_STG STG
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM IDEA_2_DB.PUBLIC.ORDERSUMMARY TGT
+        WHERE TGT.ORDERID = STG.ORDERID
+          AND TGT.CUSTID = STG.CUSTID
+    );
+
+    -- Step 12: Load customeraggregatespend
+    V_STEP := 'LOAD_AGGREGATE_SPEND';
+    
+    TRUNCATE TABLE IDEA_2_DB.PUBLIC.CUSTOMERAGGREGATESPEND;
+
+    INSERT INTO IDEA_2_DB.PUBLIC.CUSTOMERAGGREGATESPEND (NAME, ORDER_DATE, TOTAL_SPEND, RECORD_COUNT, LOAD_TIMESTAMP)
+    SELECT
+        NAME,
+        ORDER_DATE,
+        SUM(TOTALAMOUNT) AS TOTAL_SPEND,
+        COUNT(*) AS RECORD_COUNT,
+        CURRENT_TIMESTAMP()
+    FROM IDEA_2_DB.PUBLIC.ORDERSUMMARY
+    WHERE IS_CURRENT = TRUE
+    GROUP BY NAME, ORDER_DATE
+    ORDER BY NAME, ORDER_DATE;
+
+    V_ROWS_AGGREGATE := SQLROWCOUNT;
+
+    -- Log success
+    INSERT INTO IDEA_2_DB.PUBLIC.ERROR_LOG (PROCEDURE_NAME, ERROR_MESSAGE, ERROR_STATE)
+    VALUES ('SP_MASTER_PIPELINE', 'Pipeline completed successfully. Aggregate rows: ' || V_ROWS_AGGREGATE, 'SUCCESS');
+
+    RETURN OBJECT_CONSTRUCT(
+        'status', 'SUCCESS',
+        'customer_rows', V_ROWS_CUSTOMER,
+        'order_rows', V_ROWS_ORDER,
+        'aggregate_rows', V_ROWS_AGGREGATE,
+        'message', 'Pipeline executed successfully'
+    )::VARCHAR;
+
+EXCEPTION
+    WHEN OTHER THEN
+        V_ERROR_MSG := SQLERRM;
+        
+        INSERT INTO IDEA_2_DB.PUBLIC.ERROR_LOG (PROCEDURE_NAME, ERROR_MESSAGE, ERROR_STATE)
+        VALUES ('SP_MASTER_PIPELINE', 'Error at step: ' || V_STEP || ' - ' || V_ERROR_MSG, SQLSTATE);
+
+        RETURN OBJECT_CONSTRUCT(
+            'status', 'ERROR',
+            'step', V_STEP,
+            'error_message', V_ERROR_MSG,
+            'sqlstate', SQLSTATE
+        )::VARCHAR;
+END;
+$$;
